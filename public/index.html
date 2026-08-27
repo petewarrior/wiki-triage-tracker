@@ -1,32 +1,263 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-	<head>
-		<meta charset="UTF-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-		<title>Hello, World!</title>
-	</head>
-	<body>
-		<h1 id="heading"></h1>
-		<p>This page comes from a static asset stored at `public/index.html` as configured in `wrangler.jsonc`.</p>
-		<button id="button" type="button">Fetch a random UUID</button>
-		<output id="random" for="button"></output>
-		<script>
-			fetch('/message')
-				.then((resp) => resp.text())
-				.then((text) => {
-					const h1 = document.getElementById('heading');
-					h1.textContent = text;
-				});
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wikipedia Triage: Inflow vs Outflow</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 30px;
+      background-color: #f8f9fa;
+      color: #202122;
+    }
+    .container {
+      max-width: 950px;
+      margin: 0 auto;
+      background: #ffffff;
+      padding: 25px;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
+    .stats-summary {
+      display: flex;
+      gap: 20px;
+      margin-bottom: 25px;
+    }
+    .stat-card {
+      flex: 1;
+      padding: 15px;
+      border-radius: 6px;
+      background: #f1f3f5;
+      text-align: center;
+    }
+    .stat-card h3 { margin: 0 0 8px 0; font-size: 14px; color: #555; }
+    .stat-card p { margin: 0; font-size: 24px; font-weight: bold; color: #000; }
+    canvas { width: 100% !important; height: 400px !important; }
+    .note { font-size: 12px; color: #666; margin-top: 15px; text-align: center; }
+  </style>
+</head>
+<body>
 
-			const button = document.getElementById("button");
-			button.addEventListener("click", () => {
-				fetch('/random')
-					.then((resp) => resp.text())
-					.then((text) => {
-						const random = document.getElementById('random');
-						random.textContent = text;
-					});
-			});
-		</script>
-	</body>
+<div class="container">
+  <h2>English Wikipedia: Unreviewed Articles Inflow vs. Reviews</h2>
+  
+  <div class="stats-summary">
+    <div class="stat-card">
+      <h3>Current Unreviewed Backlog (Live)</h3>
+      <p id="currentBacklog">Loading...</p>
+    </div>
+    <div class="stat-card">
+      <h3>New Articles in Sample</h3>
+      <p id="creationsCount">Loading...</p>
+    </div>
+    <div class="stat-card">
+      <h3>Reviews in Sample</h3>
+      <p id="reviewsCount">Loading...</p>
+    </div>
+  </div>
+
+  <canvas id="historicalChart" style="margin-bottom: 40px;"></canvas>
+
+  <canvas id="triageChart"></canvas>
+  <p class="note">* Note: Because the API fetches a hard limit of 500 events for both creations and reviews, whichever metric happens at a slower rate will cut off earlier on the left (oldest) side of the timeline.</p>
+</div>
+
+<script>
+  const WORKER_URL = '';
+
+  async function fetchHistoricalData() {
+    const response = await fetch(WORKER_URL);
+    let data = await response.json();
+    
+    // Supabase returns descending (newest first). Reverse it for chronological charting.
+    data = data.reverse(); 
+
+    const labels = data.map(row => {
+      const d = new Date(row.created_at);
+      return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:00`;
+    });
+    
+    const counts = data.map(row => row.unreviewed_count);
+
+    return { labels, counts };
+  }
+
+  const API_URL = 'https://en.wikipedia.org/w/api.php';
+
+  // 1. Fetch live unreviewed backlog count
+  async function fetchCurrentBacklog() {
+    const params = new URLSearchParams({
+      action: 'pagetriagestats',
+      namespace: '0',
+      format: 'json',
+      origin: '*'
+    });
+    const res = await fetch(`${API_URL}?${params}`);
+    const data = await res.json();
+    return data.pagetriagestats?.stats?.unreviewedarticle?.count || 0;
+  }
+
+  // 2. Fetch the 500 most recent review actions (Outflow)
+  async function fetchReviews() {
+    const params = new URLSearchParams({
+      action: 'query',
+      list: 'logevents',
+      letype: 'pagetriage-curation',
+      lelimit: '500',
+      format: 'json',
+      origin: '*'
+    });
+    const res = await fetch(`${API_URL}?${params}`);
+    const data = await res.json();
+    return data.query?.logevents || [];
+  }
+
+  // 3. Fetch the 500 most recent new article creations in mainspace (Inflow)
+  async function fetchNewArticles() {
+    const params = new URLSearchParams({
+      action: 'query',
+      list: 'recentchanges',
+      rctype: 'new',
+      rcnamespace: '0', 
+      rclimit: '500',
+      format: 'json',
+      origin: '*'
+    });
+    const res = await fetch(`${API_URL}?${params}`);
+    const data = await res.json();
+    return data.query?.recentchanges || [];
+  }
+
+  function processMergedData(reviews, creations) {
+    const hourlyData = {};
+
+    // Helper to group events into hourly buckets using integer timestamps for accurate sorting
+    function processEvent(event, type) {
+      const d = new Date(event.timestamp);
+      d.setMinutes(0, 0, 0); // Floor to the start of the hour
+      const ts = d.getTime();
+
+      if (!hourlyData[ts]) {
+        const label = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:00`;
+        hourlyData[ts] = { label, reviews: 0, creations: 0 };
+      }
+      hourlyData[ts][type]++;
+    }
+
+    reviews.forEach(e => processEvent(e, 'reviews'));
+    creations.forEach(e => processEvent(e, 'creations'));
+
+    // Sort chronologically by the epoch timestamp key
+    const sortedTimestamps = Object.keys(hourlyData).sort((a, b) => a - b);
+    
+    return {
+      labels: sortedTimestamps.map(ts => hourlyData[ts].label),
+      reviewCounts: sortedTimestamps.map(ts => hourlyData[ts].reviews),
+      creationCounts: sortedTimestamps.map(ts => hourlyData[ts].creations)
+    };
+  }
+
+  async function initChart() {
+    try {
+      // Execute all API requests in parallel
+      const [currentBacklog, reviews, creations, historicalData] = await Promise.all([
+        fetchCurrentBacklog(),
+        fetchReviews(),
+        fetchNewArticles(),
+        fetchHistoricalData()
+      ]);
+
+      // Update UI Stats
+      document.getElementById('currentBacklog').innerText = Number(currentBacklog).toLocaleString();
+      document.getElementById('reviewsCount').innerText = reviews.length.toLocaleString();
+      document.getElementById('creationsCount').innerText = creations.length.toLocaleString();
+
+      const timelineData = processMergedData(reviews, creations);
+
+      // 3. Render the NEW Long-Term Historical Chart
+      const histCtx = document.getElementById('historicalChart').getContext('2d');
+      new Chart(histCtx, {
+        type: 'line',
+        data: {
+          labels: historicalData.labels,
+          datasets: [{
+            label: 'Total Unreviewed Backlog (Historical)',
+            data: historicalData.counts,
+            borderColor: '#9b59b6',
+            backgroundColor: 'rgba(155, 89, 182, 0.2)',
+            fill: true,
+            tension: 0.2
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            title: { display: true, text: 'Long-Term Backlog Trend (Worker Data)' }
+          },
+          scales: {
+            y: { title: { display: true, text: 'Total Unreviewed Pages' } },
+            x: { title: { display: true, text: 'Time' } }
+          }
+        }
+      });
+
+      // Render Chart
+      const ctx = document.getElementById('triageChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: timelineData.labels,
+          datasets: [
+            {
+              label: 'New Articles Added to Queue (Inflow)',
+              data: timelineData.creationCounts,
+              borderColor: '#FF6384',
+              backgroundColor: 'rgba(255, 99, 132, 0.1)',
+              fill: true,
+              tension: 0.3
+            },
+            {
+              label: 'Page Reviews Completed (Outflow)',
+              data: timelineData.reviewCounts,
+              borderColor: '#36A2EB',
+              backgroundColor: 'rgba(54, 162, 235, 0.1)',
+              fill: true,
+              tension: 0.3
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          // maintainAspectRatio: false,
+          plugins: {
+            title: {
+              display: true,
+              text: 'Hourly Unreviewed Article Flow vs. Review Actions'
+            },
+            tooltip: { mode: 'index', intersect: false }
+          },
+          interaction: { mode: 'nearest', axis: 'x', intersect: false },
+          scales: {
+            y: {
+              beginAtZero: true,
+              title: { display: true, text: 'Volume (Pages)' }
+            },
+            x: {
+              title: { display: true, text: 'Time (Hourly Aggregation)' }
+            }
+          }
+        }
+      });
+
+    } catch (error) {
+      console.error('Error fetching Wikipedia API data:', error);
+    }
+  }
+
+  initChart();
+</script>
+
+</body>
 </html>
